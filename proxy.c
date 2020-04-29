@@ -12,6 +12,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <sys/time.h>
 
 typedef struct HTTPCache {
     char* key;
@@ -41,7 +42,22 @@ struct bannedIP {
 };
 
 HTTPcache* cache[10];
-pthread_mutex_t mutex;
+pthread_mutex_t mutex, bwmutex;
+int currentBandwidth;
+int networkLimit;
+int backoffTime = 200000;
+
+int updateBW(int bytes) {
+    currentBandwidth += bytes;
+    if(currentBandwidth > networkLimit) {
+        backoffTime = backoffTime*(1.2);
+        return backoffTime;
+    }
+    else {
+        backoffTime = 200000;
+        return 0;
+    }
+}
 
 void removeIP(struct bannedIP** ips, char* ip) {
     
@@ -102,13 +118,21 @@ void banIP(char* ip, struct bannedIP** ips) {
 void tooManyRequests(int fd, char* ip, int ban, struct bannedIP** ips) {
     char* buffer = malloc(1000);
     bzero(buffer, 1000);
-    read(fd, buffer, 1000);
+    int n = read(fd, buffer, 1000);
     char* temp = "HTTP/1.1 429 Too Many Requests\r\nContent-Type: text/html\r\nRetry-After: 3600\r\n\r\n";
     if(write(fd, temp, 78) < 0)
         fprintf(stderr, "ERROR writing too socket\n");
     if(!ban)
         banIP(ip, ips);
     free(buffer);
+}
+
+void incrementBWLimit() {
+    pthread_mutex_lock(&bwmutex);
+    currentBandwidth -= networkLimit;
+    if(currentBandwidth < 0)
+        currentBandwidth = 0;
+    pthread_mutex_unlock(&bwmutex);
 }
 
 struct rateLimit* removeBucket(struct rateLimit** bucket, char* ip) {
@@ -196,17 +220,18 @@ int existsInCache(char* key) {
     return -1;
 } 
 
-int insertAgeToHeader(char* header, int age) {
+int insertAgeToHeader(char* header, int age, int size) {
 
     char* body = malloc(10000000);
     char* temp = malloc(sizeof(int));
     bzero(body, 10000000);
+    int headerLength = strstr(header, "\r\n\r\n") - header;
 
     //Change the age to a string so that it can be added
     sprintf(temp, "%d", age);
-    strcpy(body, strstr(header, "\r\n\r\n"));
+    memcpy(body, strstr(header, "\r\n\r\n"), (size-headerLength));
 
-    header[(strstr(header, "\r\n\r\n") - header)] = '\0';
+    header[headerLength] = '\0';
     strcat(header, "\r\nAge: \0");
     strcat(header, temp);
 
@@ -280,7 +305,7 @@ int transferGetData(int serverfd, int clientfd, int n, HTTPcache** cache, char* 
     buffer[n] = '\0';
 
     if(strstr(buffer, "HTTP/1.1 304 Not Modified") != NULL) {
-        write(clientfd, buffer, n);
+        int m = write(clientfd, buffer, n);
         free(buffer);
         return -1;
     }
@@ -298,6 +323,14 @@ int transferGetData(int serverfd, int clientfd, int n, HTTPcache** cache, char* 
         bytesLeft = atoi(strtok(contentLength, "\n")) - n + headerSize;
     }
 
+    if(networkLimit > 0) {
+        pthread_mutex_lock(&bwmutex);
+        int backoffTime = updateBW(n);
+        pthread_mutex_unlock(&bwmutex);
+        if(backoffTime) 
+        usleep(backoffTime);
+    }   
+
     while(bytesLeft > 0) {
         if((n = read(serverfd, buffer+bytesRead, 10000000-bytesRead)) < 0)
             fprintf(stderr, "ERROR reading from socket\n");
@@ -311,9 +344,17 @@ int transferGetData(int serverfd, int clientfd, int n, HTTPcache** cache, char* 
     }
 
     if((m = existsInCache(key)) >= 0) {
-        insertAgeToHeader(buffer, time(NULL)-cache[m]->age);
+        insertAgeToHeader(buffer, time(NULL)-cache[m]->age, bytesRead);
     } else {
-        insertAgeToHeader(buffer, 0);
+        insertAgeToHeader(buffer, 0, bytesRead);
+    }
+
+    if(networkLimit > 0) {
+        pthread_mutex_lock(&bwmutex);
+        backoffTime = updateBW(bytesRead);
+        pthread_mutex_unlock(&bwmutex);
+        if(backoffTime) 
+        usleep(backoffTime);
     }
 
     int bytesWritten = 0;
@@ -337,6 +378,7 @@ void transferConnectData(int serverfd, int clientfd, struct serverInfo *info) {
     struct timeval timeout;
     timeout.tv_sec = 1;
     timeout.tv_usec = 0;
+    int totalTraffic = 0;
 
     fd_set fds, fd_copy;
     int sockfd = info->mainfd, selectVal, n = 0, m = 9;
@@ -348,7 +390,7 @@ void transferConnectData(int serverfd, int clientfd, struct serverInfo *info) {
     FD_SET(clientfd, &fd_copy);
     FD_SET(serverfd, &fds);
     FD_SET(serverfd, &fd_copy);
-    int httpsDone = 0;
+    int httpsDone = 0, backoffTime = 0;
 
     while(1) {
         FD_ZERO(&fds);
@@ -372,7 +414,16 @@ void transferConnectData(int serverfd, int clientfd, struct serverInfo *info) {
                         }
                         else
                             httpsDone = 0;
+                        if(networkLimit > 0) {
+                            pthread_mutex_lock(&bwmutex);
+                            backoffTime = updateBW(n);
+                            pthread_mutex_unlock(&bwmutex);
+                            if(backoffTime) 
+                                usleep(backoffTime);
+                        }
+                        totalTraffic += n;
                         m = write(serverfd, buffer, n);
+                        totalTraffic += m;
                     } else if(i == serverfd) {
                         n = read(serverfd, buffer, 10000001);
                         if(n == 0) {
@@ -380,13 +431,22 @@ void transferConnectData(int serverfd, int clientfd, struct serverInfo *info) {
                             continue;
                         }
                         else if(n < 0) {
-                            free(buffer);
-                            return;
+                            perror("Error printed by perror");
+                            exit(1);
                         } 
                         else 
                             httpsDone = 0;
+                        if(networkLimit > 0) {
+                            pthread_mutex_lock(&bwmutex);
+                            backoffTime = updateBW(n);
+                            pthread_mutex_unlock(&bwmutex);
+                            if(backoffTime) 
+                                usleep(backoffTime);
+                        }
+                        totalTraffic += n;
                         if((m = write(clientfd, buffer, n)) < 0)
                             fprintf(stderr, "Write error.\n");
+                        totalTraffic += m;
                     }
                 }
             }
@@ -395,6 +455,7 @@ void transferConnectData(int serverfd, int clientfd, struct serverInfo *info) {
             }
         }
     }
+
     free(buffer);
 }
 
@@ -405,12 +466,11 @@ void *serverSocket(void* clientInfo) {
     int bytes = 0, serverfd = 0;
     struct sockaddr_in sadd;
     struct hostent* server;
-    int servPort, n = 0, contentChunk = 0, conn = 0;
+    int servPort, n = 0, contentChunk = 0, conn = 0, backoffTime = 0;
 
     int clientfd = info->client_fd;
 
     serverfd = socket(AF_INET, SOCK_STREAM, 0);
-
 
     if((n = read(clientfd,buffer,10000000)) < 0) {
             printf("ERROR reading from socket");
@@ -422,7 +482,7 @@ void *serverSocket(void* clientInfo) {
         close(serverfd);
         close(clientfd);
         return NULL;
-    }
+    } 
 
     char* intactBuffer = malloc(10000000);
     memcpy(intactBuffer, buffer, n);
@@ -505,6 +565,34 @@ void *serverSocket(void* clientInfo) {
     return NULL;
 }
 
+int parseInput(int argc, char** argv) {
+
+    char* arg;
+
+    if(argc == 2) {
+        if(strstr(argv[1], "--help") != NULL) {
+            printf("Input should be ./a.out followed by the desired port number.\n");
+            printf("Optional option is '--bw-limit=' followed by the desired bandwidth");
+            printf(" rate limit in KB/s.\n");
+            return -1;
+        } else {
+            networkLimit = 0;
+            return atoi(argv[1]);
+        }
+    } else if(argc == 3) {
+        if((arg = strstr(argv[2], "--bw-limit=")) != NULL) {
+            networkLimit = 1000*atoi(arg+11);
+            return atoi(argv[1]);
+        } else {
+            printf("Expected usage: ./a.out [Port Number] [Bandwidth Limit]\n");
+            return -1;
+        }
+    } else {
+        printf("Expected usage: ./a.out [Port Number] [Bandwidth Limit]\n");
+        return -1;
+    }
+}
+
 int main(int argc, char** argv) {
 
     pthread_t thread;
@@ -518,7 +606,11 @@ int main(int argc, char** argv) {
     struct rateLimit* bucket = NULL;
     struct bannedIP* ips = NULL;
     int currTime = time(NULL), minuteCheck = 0, n = 0;
+    currentBandwidth = 0;
 
+    if((portNumber = parseInput(argc, argv)) < 0) {
+        return 1;
+    }
 
     for(int i = 0; i < 10; i++) {
         cache[i] = malloc(sizeof(HTTPcache));
@@ -526,13 +618,6 @@ int main(int argc, char** argv) {
         cache[i]->data = NULL;
         cache[i]->age = 0;
         cache[i]->death = 0;
-    }
-
-    if(argc != 2) {
-        printf("Expected usage: ./a.out [Port Number]\n");
-        return 1;
-    } else {
-        portNumber = atoi(argv[1]);
     }
 
     if((sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
@@ -575,6 +660,7 @@ int main(int argc, char** argv) {
                 if(currTime < time(NULL)) {
                     currTime = time(NULL);
                     minuteCheck++;
+                    incrementBWLimit();
                     if(minuteCheck == 60) 
                         incrementBucket(&bucket, 1);
                     else
